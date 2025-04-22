@@ -1162,7 +1162,7 @@ WHERE new_hosp_id IN (
 UPDATE processed_data
 SET ICU_readmission = COALESCE(ICU_readmission, 'No');
 
-Анализ потребности в гемодинамической поддержке
+-- Анализ потребности в гемодинамической поддержке
 
 CREATE INDEX IF NOT EXISTS idx_detailed_sofa_hosp_id ON detailed_sofa(new_hosp_id);
 CREATE INDEX IF NOT EXISTS idx_detailed_sofa_vasoactive ON detailed_sofa(vasoactive_drugs);
