@@ -52,7 +52,7 @@ The provided SQLite code performs several key functions for analyzing and proces
 
 1. **Download the SQLite database** and ensure it is accessible in your environment.
 2. **Execute the provided SQL scripts** in your SQLite database tool (e.g., DB Browser for SQLite, SQLite3 CLI, etc.).
-3. **Verify the creation of the tables** (`processed_data`, `ricd_dynamic`, 'sepsis_ML_dataset') after running the scripts.
+3. **Verify the creation of the tables** (`processed_data`, `ricd_dynamic`, `sepsis_ML_dataset`) after running the scripts.
 4. The data from these tables can be used for further clinical analysis, such as cohort identification, risk stratification, or mortality prediction.
 
 ## **License**
