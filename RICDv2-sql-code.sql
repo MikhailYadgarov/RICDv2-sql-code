@@ -2889,8 +2889,540 @@ SET mortality = (
 
 DROP TABLE temp_mortality_mapping;
 
+-- Оценка времени развития сепсиса
+ALTER TABLE ricd_dynamic ADD COLUMN sepsis_3_post_adm_hours REAL;
+
+CREATE INDEX IF NOT EXISTS idx_ricd_dynamic_sepsis3_hosp_day ON ricd_dynamic (new_hosp_id, post_admission_days);
+CREATE INDEX IF NOT EXISTS idx_all_scales_hosp_day_scale_result ON all_scales (new_hosp_id, post_admission_days, scale_eng, result);
+
+DROP TABLE IF EXISTS temp_sepsis_update;
+CREATE TEMP TABLE temp_sepsis_update AS
+SELECT 
+    r.rowid AS ricd_rowid,
+    a.post_admission_hours AS matched_post_adm_hours
+FROM 
+    ricd_dynamic r
+JOIN 
+    all_scales a
+ON 
+    r.new_hosp_id = a.new_hosp_id
+    AND r.post_admission_days = a.post_admission_days
+    AND r.SOFA = a.result
+WHERE 
+    r.sepsis_3 = 'Yes'
+    AND a.scale_eng = 'SOFA';
+
+UPDATE ricd_dynamic
+SET sepsis_3_post_adm_hours = (
+    SELECT matched_post_adm_hours
+    FROM temp_sepsis_update
+    WHERE ricd_rowid = ricd_dynamic.rowid
+)
+WHERE sepsis_3 = 'Yes'
+  AND EXISTS (
+      SELECT 1
+      FROM temp_sepsis_update
+      WHERE ricd_rowid = ricd_dynamic.rowid
+  );
+
+DROP TABLE temp_sepsis_update;
 
 
+DROP TABLE IF EXISTS first_sepsis_occurrence;
+CREATE TEMP TABLE first_sepsis_occurrence AS
+SELECT 
+    new_hosp_id,
+    sepsis_episode,
+    MIN(post_admission_days) AS first_day
+FROM ricd_dynamic
+WHERE sepsis_episode IS NOT NULL
+GROUP BY new_hosp_id, sepsis_episode;
+
+UPDATE ricd_dynamic
+SET sepsis_3_post_adm_hours = NULL
+WHERE sepsis_episode IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM first_sepsis_occurrence f
+      WHERE f.new_hosp_id = ricd_dynamic.new_hosp_id
+        AND f.sepsis_episode = ricd_dynamic.sepsis_episode
+        AND f.first_day = ricd_dynamic.post_admission_days
+  );
+
+-- Создание датасета сепсис
+DROP TABLE IF EXISTS hours_0_23;
+CREATE TEMP TABLE hours_0_23 (hour INTEGER);
+INSERT INTO hours_0_23 (hour)
+WITH RECURSIVE cnt(x) AS (
+    SELECT 0
+    UNION ALL
+    SELECT x + 1 FROM cnt WHERE x < 23
+)
+SELECT x FROM cnt;
+
+DROP TABLE IF EXISTS sepsis_ML_dataset;
+CREATE TABLE sepsis_ML_dataset AS
+SELECT
+    r.new_patient_id,
+    r.new_hosp_id,
+    r.post_admission_days,
+    h.hour AS post_admission_hours
+FROM
+    ricd_dynamic r
+CROSS JOIN
+    hours_0_23 h;
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN sepsis_3 TEXT;
+
+UPDATE sepsis_ML_dataset
+SET sepsis_3 = (
+    SELECT r.sepsis_3
+    FROM ricd_dynamic r
+    WHERE r.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND r.post_admission_days = sepsis_ML_dataset.post_admission_days
+);
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN icu_length_of_stay REAL;
+
+UPDATE sepsis_ML_dataset
+SET icu_length_of_stay = (
+    SELECT a.icu_length_of_stay
+    FROM all_patients a
+    WHERE a.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+);
+DELETE FROM sepsis_ML_dataset
+WHERE icu_length_of_stay IS NULL
+   OR icu_length_of_stay < 24;
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN always_null_sepsis3 TEXT;
+
+DROP TABLE IF EXISTS hosp_ids_all_null_sepsis3;
+CREATE TEMP TABLE hosp_ids_all_null_sepsis3 AS
+SELECT new_hosp_id
+FROM sepsis_ML_dataset
+GROUP BY new_hosp_id
+HAVING COUNT(sepsis_3) = 0;
+
+UPDATE sepsis_ML_dataset
+SET always_null_sepsis3 = 'Yes'
+WHERE new_hosp_id IN (
+    SELECT new_hosp_id FROM hosp_ids_all_null_sepsis3
+);
+DELETE FROM sepsis_ML_dataset
+WHERE always_null_sepsis3 = 'Yes';
+ALTER TABLE sepsis_ML_dataset DROP COLUMN always_null_sepsis3;
+
+DROP TABLE IF EXISTS sepsis_ML_dataset_new;
+CREATE TABLE sepsis_ML_dataset_new AS
+SELECT 
+    new_patient_id,
+    new_hosp_id,
+    post_admission_days,
+    ROW_NUMBER() OVER (
+        PARTITION BY new_hosp_id
+        ORDER BY post_admission_days, post_admission_hours
+    ) - 1 AS post_admission_hours,
+    sepsis_3,
+    icu_length_of_stay
+FROM sepsis_ML_dataset;
+
+DROP TABLE sepsis_ML_dataset;
+
+ALTER TABLE sepsis_ML_dataset_new RENAME TO sepsis_ML_dataset;
+
+DROP TABLE IF EXISTS temp_icu_intervals;
+CREATE TEMP TABLE temp_icu_intervals AS
+SELECT 
+    new_patient_id,
+    actual_department_admission_hour AS start_hour,
+    actual_department_discharge_hour AS end_hour
+FROM patient_pathway
+WHERE ICU_period = 'Yes';
+
+CREATE INDEX IF NOT EXISTS idx_temp_icu_intervals_pid ON temp_icu_intervals(new_patient_id);
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN is_in_icu_period TEXT;
+
+UPDATE sepsis_ML_dataset
+SET is_in_icu_period = 'Yes'
+WHERE EXISTS (
+    SELECT 1
+    FROM temp_icu_intervals i
+    WHERE i.new_patient_id = sepsis_ML_dataset.new_patient_id
+      AND sepsis_ML_dataset.post_admission_hours BETWEEN i.start_hour AND i.end_hour
+);
+DELETE FROM sepsis_ML_dataset
+WHERE is_in_icu_period IS NULL;
+ALTER TABLE sepsis_ML_dataset DROP COLUMN is_in_icu_period;
+
+
+
+
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN monitoring TEXT;
+
+UPDATE sepsis_ML_dataset
+SET monitoring = 'Yes'
+WHERE new_hosp_id IN (
+    SELECT DISTINCT new_hosp_id
+    FROM monitoring_data
+    WHERE LOWER(parameter) IN (
+        'heart rate',
+        'pulse',
+        'respiratory rate',
+        'temperature',
+        'systolic bp',
+        'diastolic bp',
+        'saturation (spo2)',
+        'mean ap'
+    )
+);
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN prescriptions TEXT;
+
+UPDATE sepsis_ML_dataset
+SET prescriptions = 'Yes'
+WHERE new_hosp_id IN (
+    SELECT DISTINCT new_hosp_id
+    FROM therapy_prescriptions
+);
+
+DELETE FROM sepsis_ML_dataset
+WHERE monitoring IS NULL
+   OR prescriptions IS NULL;
+
+ALTER TABLE sepsis_ML_dataset DROP COLUMN monitoring;
+ALTER TABLE sepsis_ML_dataset DROP COLUMN prescriptions;
+ALTER TABLE sepsis_ML_dataset DROP COLUMN icu_length_of_stay;
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN visit_number INTEGER;
+
+UPDATE sepsis_ML_dataset
+SET visit_number = (
+    SELECT a.visit_number
+    FROM all_patients a
+    WHERE a.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+);
+
+DELETE FROM sepsis_ML_dataset
+WHERE visit_number > 1;
+ALTER TABLE sepsis_ML_dataset DROP COLUMN visit_number;
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN sepsis_time REAL;
+
+UPDATE sepsis_ML_dataset
+SET sepsis_time = (
+    SELECT r.sepsis_3_post_adm_hours
+    FROM ricd_dynamic r
+    WHERE r.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND r.sepsis_3_post_adm_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN sepsis_episode INTEGER;
+
+UPDATE sepsis_ML_dataset
+SET sepsis_episode = (
+    SELECT r.sepsis_episode
+    FROM ricd_dynamic r
+    WHERE r.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND r.sepsis_3_post_adm_hours = sepsis_ML_dataset.sepsis_time
+    LIMIT 1
+)
+WHERE sepsis_time IS NOT NULL;
+
+DELETE FROM sepsis_ML_dataset
+WHERE sepsis_episode >= 2;
+ALTER TABLE sepsis_ML_dataset DROP COLUMN sepsis_episode;
+
+DROP TABLE IF EXISTS temp_sepsis_cutoff;
+CREATE TEMP TABLE temp_sepsis_cutoff AS
+SELECT DISTINCT new_hosp_id, sepsis_time
+FROM sepsis_ML_dataset
+WHERE sepsis_time IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_temp_cutoff_hosp_id ON temp_sepsis_cutoff(new_hosp_id);
+
+DELETE FROM sepsis_ML_dataset
+WHERE new_hosp_id IN (
+    SELECT new_hosp_id FROM temp_sepsis_cutoff
+)
+AND post_admission_hours > (
+    SELECT sepsis_time
+    FROM temp_sepsis_cutoff
+    WHERE temp_sepsis_cutoff.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+);
+UPDATE sepsis_ML_dataset
+SET sepsis_3 = NULL
+WHERE sepsis_time IS NULL;
+UPDATE sepsis_ML_dataset
+SET sepsis_3 = 'No'
+WHERE sepsis_3 IS NULL;
+
+DROP TABLE IF EXISTS temp_sepsis_window;
+CREATE TEMP TABLE temp_sepsis_window AS
+SELECT DISTINCT new_hosp_id, sepsis_time
+FROM sepsis_ML_dataset
+WHERE sepsis_time IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_temp_sepsis_window_hosp_id ON temp_sepsis_window(new_hosp_id);
+
+UPDATE sepsis_ML_dataset
+SET sepsis_3 = 'Yes'
+WHERE new_hosp_id IN (
+    SELECT new_hosp_id FROM temp_sepsis_window
+)
+AND post_admission_hours BETWEEN (
+    SELECT sepsis_time - 6
+    FROM temp_sepsis_window
+    WHERE temp_sepsis_window.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+)
+AND (
+    SELECT sepsis_time
+    FROM temp_sepsis_window
+    WHERE temp_sepsis_window.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+);
+
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN age REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN sex TEXT;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN sofa REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN wbc REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN plt REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN crp REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN hb REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN albumin REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN lactate REAL;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN pH REAL;
+
+
+UPDATE sepsis_ML_dataset
+SET age = (
+    SELECT ap.age
+    FROM all_patients ap
+    WHERE ap.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+);
+
+UPDATE sepsis_ML_dataset
+SET sex = (
+    SELECT ap.sex
+    FROM all_patients ap
+    WHERE ap.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+);
+UPDATE sepsis_ML_dataset SET sex = '1' WHERE LOWER(sex) = 'male';
+UPDATE sepsis_ML_dataset SET sex = '2' WHERE LOWER(sex) = 'female';
+
+UPDATE sepsis_ML_dataset
+SET sofa = (
+    SELECT a.result
+    FROM all_scales a
+    WHERE a.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND a.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+      AND a.scale_eng = 'SOFA'
+    LIMIT 1
+);
+
+DROP TABLE IF EXISTS temp_wbc;
+CREATE TEMP TABLE temp_wbc AS
+SELECT
+    new_hosp_id,
+    post_admission_hours,
+    result_num AS wbc_value
+FROM lab_data
+WHERE parameter_eng_short = 'Leukocytes (WBC)'
+  AND result_num IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_temp_wbc_hosp_hour
+ON temp_wbc (new_hosp_id, post_admission_hours);
+
+UPDATE sepsis_ML_dataset
+SET wbc = (
+    SELECT w.wbc_value
+    FROM temp_wbc w
+    WHERE w.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND w.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+
+DROP TABLE temp_wbc;
+
+DROP TABLE IF EXISTS temp_plt;
+CREATE TEMP TABLE temp_plt AS
+SELECT new_hosp_id, post_admission_hours, result_num AS plt_value
+FROM lab_data
+WHERE parameter_eng_short = 'Platelets (PLT)' AND result_num IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_temp_plt ON temp_plt(new_hosp_id, post_admission_hours);
+UPDATE sepsis_ML_dataset
+SET plt = (
+    SELECT p.plt_value
+    FROM temp_plt p
+    WHERE p.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND p.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+DROP TABLE temp_plt;
+
+DROP TABLE IF EXISTS temp_crp;
+CREATE TEMP TABLE temp_crp AS
+SELECT new_hosp_id, post_admission_hours, result_num AS crp_value
+FROM lab_data
+WHERE parameter_eng_short = 'C-Reactive Protein (CRP)' AND result_num IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_temp_crp ON temp_crp(new_hosp_id, post_admission_hours);
+UPDATE sepsis_ML_dataset
+SET crp = (
+    SELECT c.crp_value
+    FROM temp_crp c
+    WHERE c.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND c.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+DROP TABLE temp_crp;
+
+DROP TABLE IF EXISTS temp_hb;
+CREATE TEMP TABLE temp_hb AS
+SELECT new_hosp_id, post_admission_hours, result_num AS hb_value
+FROM lab_data
+WHERE parameter_eng_short = 'Hemoglobin (ctHB)' AND result_num IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_temp_hb ON temp_hb(new_hosp_id, post_admission_hours);
+UPDATE sepsis_ML_dataset
+SET hb = (
+    SELECT h.hb_value
+    FROM temp_hb h
+    WHERE h.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND h.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+DROP TABLE temp_hb;
+
+DROP TABLE IF EXISTS temp_albumin;
+CREATE TEMP TABLE temp_albumin AS
+SELECT new_hosp_id, post_admission_hours, result_num AS albumin_value
+FROM lab_data
+WHERE parameter_eng_short = 'Albumin' AND result_num IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_temp_albumin ON temp_albumin(new_hosp_id, post_admission_hours);
+UPDATE sepsis_ML_dataset
+SET albumin = (
+    SELECT a.albumin_value
+    FROM temp_albumin a
+    WHERE a.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND a.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+DROP TABLE temp_albumin;
+
+DROP TABLE IF EXISTS temp_lactate;
+CREATE TEMP TABLE temp_lactate AS
+SELECT new_hosp_id, post_admission_hours, result_num AS lactate_value
+FROM lab_data
+WHERE parameter_eng_short = 'Lactate (cLac)' AND result_num IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_temp_lactate ON temp_lactate(new_hosp_id, post_admission_hours);
+UPDATE sepsis_ML_dataset
+SET lactate = (
+    SELECT l.lactate_value
+    FROM temp_lactate l
+    WHERE l.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND l.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+DROP TABLE temp_lactate;
+
+DROP TABLE IF EXISTS temp_ph;
+CREATE TEMP TABLE temp_ph AS
+SELECT new_hosp_id, post_admission_hours, result_num AS ph_value
+FROM lab_data
+WHERE parameter_eng_short = 'pH'
+  AND biomaterial_eng = 'Arterial blood'
+  AND result_num IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_temp_ph ON temp_ph(new_hosp_id, post_admission_hours);
+UPDATE sepsis_ML_dataset
+SET pH = (
+    SELECT p.ph_value
+    FROM temp_ph p
+    WHERE p.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+      AND p.post_admission_hours = sepsis_ML_dataset.post_admission_hours
+    LIMIT 1
+);
+DROP TABLE temp_ph;
+UPDATE sepsis_ML_dataset
+SET sepsis_3 = 1
+WHERE sepsis_3 = 'Yes';
+
+UPDATE sepsis_ML_dataset
+SET sepsis_3 = 0
+WHERE sepsis_3 = 'No';
+
+
+ALTER TABLE sepsis_ML_dataset ADD COLUMN diabetis_2_type INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN chronic_kidney_disease INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN COPD INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN coronary_artery_disease INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN arterial_hypertension INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN heart_failure INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN ischemic_stroke INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN hemorrhagic_stroke INTEGER;
+ALTER TABLE sepsis_ML_dataset ADD COLUMN traumatic_brain_injury INTEGER;
+
+DROP TABLE IF EXISTS temp_comorb;
+CREATE TEMP TABLE temp_comorb AS
+SELECT 
+    new_hosp_id,
+    diabetis_2_type,
+    chronic_kidney_disease,
+    COPD,
+    coronary_artery_disease,
+    "arterial hypertension" AS arterial_hypertension,
+    heart_failure,
+    "ischemic stroke" AS ischemic_stroke,
+    "hemorrhagic stroke" AS hemorrhagic_stroke,
+    "traumatic brain injury" AS traumatic_brain_injury
+FROM processed_data;
+
+CREATE INDEX IF NOT EXISTS idx_temp_comorb ON temp_comorb(new_hosp_id);
+
+UPDATE sepsis_ML_dataset
+SET 
+    diabetis_2_type = (SELECT t.diabetis_2_type FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    chronic_kidney_disease = (SELECT t.chronic_kidney_disease FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    COPD = (SELECT t.COPD FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    coronary_artery_disease = (SELECT t.coronary_artery_disease FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    arterial_hypertension = (SELECT t.arterial_hypertension FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    heart_failure = (SELECT t.heart_failure FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    ischemic_stroke = (SELECT t.ischemic_stroke FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    hemorrhagic_stroke = (SELECT t.hemorrhagic_stroke FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id),
+    traumatic_brain_injury = (SELECT t.traumatic_brain_injury FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id)
+WHERE EXISTS (
+    SELECT 1 FROM temp_comorb t WHERE t.new_hosp_id = sepsis_ML_dataset.new_hosp_id
+);
+
+DROP TABLE temp_comorb;
+
+
+UPDATE sepsis_ML_dataset SET diabetis_2_type = 1 WHERE diabetis_2_type = 'Yes';
+UPDATE sepsis_ML_dataset SET diabetis_2_type = 0 WHERE diabetis_2_type IS NULL;
+
+UPDATE sepsis_ML_dataset SET chronic_kidney_disease = 1 WHERE chronic_kidney_disease = 'Yes';
+UPDATE sepsis_ML_dataset SET chronic_kidney_disease = 0 WHERE chronic_kidney_disease IS NULL;
+
+UPDATE sepsis_ML_dataset SET COPD = 1 WHERE COPD = 'Yes';
+UPDATE sepsis_ML_dataset SET COPD = 0 WHERE COPD IS NULL;
+
+UPDATE sepsis_ML_dataset SET coronary_artery_disease = 1 WHERE coronary_artery_disease = 'Yes';
+UPDATE sepsis_ML_dataset SET coronary_artery_disease = 0 WHERE coronary_artery_disease IS NULL;
+
+UPDATE sepsis_ML_dataset SET arterial_hypertension = 1 WHERE arterial_hypertension = 'Yes';
+UPDATE sepsis_ML_dataset SET arterial_hypertension = 0 WHERE arterial_hypertension IS NULL;
+
+UPDATE sepsis_ML_dataset SET heart_failure = 1 WHERE heart_failure = 'Yes';
+UPDATE sepsis_ML_dataset SET heart_failure = 0 WHERE heart_failure IS NULL;
+
+UPDATE sepsis_ML_dataset SET ischemic_stroke = 1 WHERE ischemic_stroke = 'Yes';
+UPDATE sepsis_ML_dataset SET ischemic_stroke = 0 WHERE ischemic_stroke IS NULL;
+
+UPDATE sepsis_ML_dataset SET hemorrhagic_stroke = 1 WHERE hemorrhagic_stroke = 'Yes';
+UPDATE sepsis_ML_dataset SET hemorrhagic_stroke = 0 WHERE hemorrhagic_stroke IS NULL;
+
+UPDATE sepsis_ML_dataset SET traumatic_brain_injury = 1 WHERE traumatic_brain_injury = 'Yes';
+UPDATE sepsis_ML_dataset SET traumatic_brain_injury = 0 WHERE traumatic_brain_injury = 'No';
 
 
 
