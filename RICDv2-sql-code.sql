@@ -3424,5 +3424,21 @@ UPDATE sepsis_ML_dataset SET hemorrhagic_stroke = 0 WHERE hemorrhagic_stroke IS 
 UPDATE sepsis_ML_dataset SET traumatic_brain_injury = 1 WHERE traumatic_brain_injury = 'Yes';
 UPDATE sepsis_ML_dataset SET traumatic_brain_injury = 0 WHERE traumatic_brain_injury = 'No';
 
+ALTER TABLE processed_data ADD COLUMN pneumonia_nosocomial TEXT;
+
+UPDATE processed_data
+SET pneumonia_nosocomial = 'Yes'
+WHERE new_hosp_id IN (
+    SELECT DISTINCT new_hosp_id
+    FROM icd10_diagnoses
+    WHERE ICD_10 IN (
+        'J12.8', 'J12.9', 'J15.0', 'J15.1', 'J15.2', 'J15.5', 'J15.6', 'J15.8', 'J15.9',
+        'J16.8', 'J17.1', 'J17.8', 'J18.0', 'J18.1', 'J18.2', 'J18.8', 'J18.9'
+    )
+    AND post_admission_hours > 48
+    AND (diagnosis_type = 'discharge diagnosis: complications' 
+         OR diagnosis_type = 'complications of the primary disease')
+);
+
 
 
