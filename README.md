@@ -1,4 +1,4 @@
-# **RICD SQLite And Python Codes for Clinical Analysis**
+# **RICD SQLite Codes for Clinical Analysis**
 
 ## **Overview**
 
